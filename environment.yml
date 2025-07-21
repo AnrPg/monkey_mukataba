@@ -14,4 +14,4 @@ dependencies:
   - menuinst
   - anaconda-anon-usage
   - pip:
-    - 
+    - playwright==1.53.0
