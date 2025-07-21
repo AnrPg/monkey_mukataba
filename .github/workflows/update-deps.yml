@@ -1,0 +1,50 @@
+name: Export Dependencies
+
+on:
+  push:
+
+permissions:
+  contents: write  # allow committing changes back to the repo
+
+jobs:
+  export-and-generate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Miniconda
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          python-version: 3.11
+          activate-environment: env
+
+      - name: Export Conda history to YAML
+        run: |
+          conda env export --from-history \
+            | grep -v "^prefix: " \
+            > environment.yml
+
+      - name: Cache pip packages
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/*.py') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install pipreqs
+        run: pip install pipreqs
+
+      - name: Append pip dependencies to environment.yml
+        run: |
+          echo "  - pip:" >> environment.yml
+          pipreqs --force --print . \
+            | sed 's/^/    - /' >> environment.yml
+
+      - name: Commit and push environment.yml
+        uses: stefanzweifel/git-auto-commit-action@v6
+        with:
+          commit_message: "chore: update environment.yml"
+          file_pattern: environment.yml
