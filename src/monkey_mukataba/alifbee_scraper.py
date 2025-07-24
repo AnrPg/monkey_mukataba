@@ -1,39 +1,26 @@
 #!/usr/bin/env python3
-
-import os
-import time
-import asyncio
+import os, asyncio
 from pathlib import Path
 from playwright.async_api import async_playwright
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
 
 BASE_URL = "https://app.alifbee.com/en/lessons"
 OUTPUT_DIR = "alifbee_export"
-USER_DATA_DIR = "./user-data"  # Persistent login
-HEADLESS = False  # Set True to run in background
+USER_DATA_DIR = "./user-data"
+HEADLESS = False
 
+# Shared stealth patch
 async def stealth_patch(page):
-    print("🔧 Applying stealth patch to evade detection...")
-    await page.add_init_script("""() => {
-        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        window.navigator.chrome = { runtime: {} };
-        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-    }""")
-    print("✅ Stealth patch applied successfully.")
+    await page.add_init_script(
+        """() => {
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            window.navigator.chrome = { runtime: {} };
+            Object.defineProperty(navigator, 'languages', { get: () => ['en-US','en'] });
+            Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
+        }"""
+    )
 
-async def save_html(content: str, chapter: str, lesson: str, question_index: int):
-    print(f"💾 Preparing to save HTML content for question {question_index} in '{chapter} → {lesson}'...")
-    safe_chapter = chapter.replace(" ", "_").replace("/", "-")
-    safe_lesson = lesson.replace(" ", "_").replace("/", "-")
-    path = Path(OUTPUT_DIR) / safe_chapter / safe_lesson
-    path.mkdir(parents=True, exist_ok=True)
-    filename = f"{question_index:02}.html"
-    with open(path / filename, "w", encoding="utf-8") as f:
-        f.write(content)
-    print(f"📥 Saved HTML: {path / filename}")
-
-async def handle_login(page):
+async def handle_login(page, context):
     print("🔐 Checking if login is required...")
     if await page.locator("a[href='/en/login']").is_visible():
         print("🔑 Login link found. Navigating to login page...")
@@ -42,38 +29,84 @@ async def handle_login(page):
 
         print("🔍 Waiting for Google login button...")
         await page.wait_for_selector("img[alt='Google']", timeout=10000)
-        await page.click("img[alt='Google']")
 
-        print("🧠 Please complete Google authentication manually in the browser popup.")
+        print("🧠 Clicking Google login button...")
+        async with page.expect_popup() as popup_info:
+            await page.click("img[alt='Google']")
+        popup = await popup_info.value
+        await popup.wait_for_load_state()
+        print("🧠 Google login popup opened.")
+
+
         print("⏳ Waiting for user to finish login...")
 
-        while True:
+        for attempt in range(60):  # wait up to 180 seconds
+            current_url = page.url
+            if "/en/lessons" in current_url:
+                print("✅ Redirected to lessons page.")
+                break
             try:
-                # If lessons page loads, we're in
-                if await page.locator("h2.H2.purple-51").first.is_visible(timeout=10000):
+                if await page.locator("h2.H2.purple-51").first.is_visible(timeout=3000):
                     print("✅ Login successful! Proceeding with scraping...")
                     break
             except:
-                print("🕐 Still waiting for login... make sure you're completing the Google popup.")
-                await asyncio.sleep(3)
+                pass
+
+            print(f"🕐 Still waiting for login... current URL: {current_url}")
+            await asyncio.sleep(3)
+        else:
+            print("❌ Login failed or timeout occurred.")
+            await context.close()
+            return False
+
+        # Save session
+        await context.storage_state(path=USER_DATA_DIR)
     else:
         print("✅ Already logged in. Proceeding directly.")
+    return True
+
+
+async def save_html(html, chapter, lesson, question_num):
+    folder = Path(OUTPUT_DIR) / chapter.strip() / lesson.strip()
+    folder.mkdir(parents=True, exist_ok=True)
+    out_path = folder / f"question_{question_num:02}.html"
+    out_path.write_text(html)
 
 async def scrape():
-    print("🚀 Launching Playwright...")
     async with async_playwright() as p:
-        print("🦊 Launching persistent Firefox context...")
-        browser = await p.firefox.launch_persistent_context(
-            USER_DATA_DIR,
-            headless=HEADLESS
+        browser = await p.chromium.launch(
+            headless=HEADLESS,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--disable-infobars",
+                "--disable-extensions",
+                "--no-sandbox",
+                "--disable-web-security",
+                "--start-maximized",
+                "--window-size=1280,720"
+            ],
         )
-        page = await browser.new_page()
+
+        context = await browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/114.0.5735.198 Safari/537.36"
+            ),
+            viewport={"width": 1280, "height": 720},
+            locale="en-US",
+            extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+            storage_state=USER_DATA_DIR if os.path.exists(USER_DATA_DIR) else None
+        )
+
+        page = await context.new_page()
         await stealth_patch(page)
 
-        print(f"🌍 Navigating to base URL: {BASE_URL}")
         await page.goto(BASE_URL, timeout=0)
 
-        await handle_login(page)
+        login_success = await handle_login(page, context)
+        if not login_success:
+            return
 
         print("📖 Page ready. Starting to locate chapters and lessons...")
         chapter_els = await page.locator("h2.H2.purple-51").all()
